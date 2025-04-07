@@ -39,6 +39,7 @@ parser.add_argument('--nprocessings', default=4, type=int,
                     help='total number of threads to run')
 parser.add_argument('--modeid', default=0, type=int,
                     help='all filters (with N_filter % nprocessings = modeid) will be processed')
+parser.add_argument('--override-checkpoint', default='', type=str)
 parser.add_argument('--part_id', default=0, type=int, help="break total layers into parts and process each part in each process.")
 parser.add_argument('--num_parts', default=5, type=int)
 parser.add_argument('--bias_corr_act', '-bca', action="store_true")
@@ -55,14 +56,23 @@ if args.profile:
 maxsteps = 32
 maxrates = args.maxrates
 
-path_output = ('%s_nr_%04d_ns_%04d_nf_%04d_%srdcurves_channelwise_opt_dist_act%s' % (args.archname, args.maxrates, \
+net = loadnetwork(args.archname, args.gpuid)
+
+path_output = ('%s_nr_%04d_ns_%04d_nf_%04d_%srdcurves_out_channelwise_opt_dist_act%s' % (args.archname, args.maxrates, \
                                                                    args.testsize, args.nchannelbatch, "bca_" if args.bias_corr_act else "", "_Amse" if args.Amse else ""))
+
+
+if args.override_checkpoint != '':
+    all_ = net.load_state_dict(torch.load(args.override_checkpoint), strict=False)
+    print(all_)
+    print('load checkpoint from %s' % args.override_checkpoint)
+    path_output = f"ckpt_{args.override_checkpoint.split('/')[-1].split('.')[0]}_{path_output}"
+
 isExists=os.path.exists(path_output)
 if not isExists:
     os.makedirs(path_output)
 
 
-net = loadnetwork(args.archname, args.gpuid)
 # images, labels = loadvaldata(args.datapath, args.gpuid, testsize=args.testsize)
 if "vit" in args.archname and "mae" not in args.archname:
     args.mean = [0.5,] * 3
@@ -91,9 +101,10 @@ Y_cats = gettop1(Y)
 top_1, top_5 = accuracy(Y, labels, topk=(1,5))
 if not args.mute_print:
     print('original network %s accuracy: top1 %5.2f top5 %5.2f' % (args.archname, top_1, top_5))
-dimens = [hookedlayers[i].input if isinstance(layers[i].layer, nn.Conv2d) else hookedlayers[i].input.flip(0) for i in range(0,len(hookedlayers))]
+dimens = [hookedlayers[i].output if isinstance(layers[i].layer, nn.Conv2d) else hookedlayers[i].output.flip(0) for i in range(0,len(hookedlayers))]
+
 if args.Amse:
-    fp_acts = [h.input_tensor.clone() for h in hookedlayers]
+    fp_acts = [h.output_tensor.clone() for h in hookedlayers]
     for h in hookedlayers:
         h.close()
 else:
@@ -106,7 +117,7 @@ len_part = math.ceil(len(layers) / args.num_parts)
 with torch.no_grad():
     for l in range(args.part_id * len_part, min((args.part_id + 1) * len_part, len(layers))):
         layer_weights = layers[l].weight.clone()
-        nchannels = layers[l].layer.in_channels if isinstance(layers[l].layer, nn.Conv2d) else layers[l].layer.in_features
+        nchannels = layers[l].layer.out_channels if isinstance(layers[l].layer, nn.Conv2d) else layers[l].layer.out_features
         ngroups = math.ceil(nchannels / args.nchannelbatch)
         layers[l].coded, layers[l].delta = [0] * ngroups, [0] * ngroups
 
@@ -129,7 +140,7 @@ with torch.no_grad():
                     sec = time()
                     delta = start + 0.25*j
                     layers[l].quantized, layers[l].coded[g], layers[l].delta[g], layers[l].chans_per_group = True, coded*b, delta, chans_per_group
-
+                    layers[l].mode = "out_channel"
                     for l_ in layers:
                         l_.count = 0
                     

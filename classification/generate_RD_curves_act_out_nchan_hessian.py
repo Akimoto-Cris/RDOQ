@@ -13,7 +13,7 @@ from algo import *
 from header import *
 from time import time
 from timm.data.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
+import einops
 # torch.backends.cudnn.benchmark = True
 
 parser = argparse.ArgumentParser(description='generate rate-distortion curves')
@@ -39,15 +39,18 @@ parser.add_argument('--nprocessings', default=4, type=int,
                     help='total number of threads to run')
 parser.add_argument('--modeid', default=0, type=int,
                     help='all filters (with N_filter % nprocessings = modeid) will be processed')
+parser.add_argument('--override-checkpoint', default='', type=str)
 parser.add_argument('--part_id', default=0, type=int, help="break total layers into parts and process each part in each process.")
 parser.add_argument('--num_parts', default=5, type=int)
 parser.add_argument('--bias_corr_act', '-bca', action="store_true")
 parser.add_argument('--Amse', action="store_true", help="output MSE of current layer activation in repl. of Ysse")
+parser.add_argument('--kappa', default=1e-7, type=float)
 parser.add_argument('--mute-print', action="store_true")
 parser.add_argument('--profile', action="store_true")
 
 args = parser.parse_args()
 args.val_testsize = args.testsize
+
 
 if args.profile:
     from torch.profiler import profile, record_function, ProfilerActivity
@@ -55,14 +58,23 @@ if args.profile:
 maxsteps = 32
 maxrates = args.maxrates
 
-path_output = ('%s_nr_%04d_ns_%04d_nf_%04d_%srdcurves_channelwise_opt_dist_act%s' % (args.archname, args.maxrates, \
+net = loadnetwork(args.archname, args.gpuid)
+
+path_output = ('./hessian_curves/%s_nr_%04d_ns_%04d_nf_%04d_%srdcurves_out_channelwise_opt_dist_act%s' % (args.archname, args.maxrates, \
                                                                    args.testsize, args.nchannelbatch, "bca_" if args.bias_corr_act else "", "_Amse" if args.Amse else ""))
+
+
+if args.override_checkpoint != '':
+    all_ = net.load_state_dict(torch.load(args.override_checkpoint), strict=False)
+    print(all_)
+    print('load checkpoint from %s' % args.override_checkpoint)
+    path_output = f"ckpt_{args.override_checkpoint.split('/')[-1].split('.')[0]}_{path_output}"
+
 isExists=os.path.exists(path_output)
 if not isExists:
     os.makedirs(path_output)
 
 
-net = loadnetwork(args.archname, args.gpuid)
 # images, labels = loadvaldata(args.datapath, args.gpuid, testsize=args.testsize)
 if "vit" in args.archname and "mae" not in args.archname:
     args.mean = [0.5,] * 3
@@ -74,14 +86,11 @@ if "384" in args.archname:
     loader = get_calib_imagenet_dali_loader(args, 384, 384)
 else:
     loader = get_calib_imagenet_dali_loader(args)
-    
-neural, layers = convert_qconv(net, stats=False)
 
 net.eval()
-neural.eval()
-hookedlayers = hooklayers(layers)
+layers = [m for m in net.modules() if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear)]
 
-# import pdb; pdb.set_trace()
+
 if not args.mute_print:
     print('total number of layers: %d' % (len(layers)))
 
@@ -91,35 +100,68 @@ Y_cats = gettop1(Y)
 top_1, top_5 = accuracy(Y, labels, topk=(1,5))
 if not args.mute_print:
     print('original network %s accuracy: top1 %5.2f top5 %5.2f' % (args.archname, top_1, top_5))
-dimens = [hookedlayers[i].input if isinstance(layers[i].layer, nn.Conv2d) else hookedlayers[i].input.flip(0) for i in range(0,len(hookedlayers))]
-if args.Amse:
-    fp_acts = [h.input_tensor.clone() for h in hookedlayers]
-    for h in hookedlayers:
-        h.close()
-else:
-    for l in hookedlayers:
-        l.close()
+
+
+
+def transform(x):
+    if len(x.shape) == 4:
+        return einops.rearrange(x, 'b c h w -> b (h w) c')
+    elif len(x.shape) == 3:
+        return x #einops.rearrange(x, 'b t c -> (b t) c')
+    elif len(x.shape) == 2:
+        return x[:, None, :]
+    # return x.flatten(1)
+
 
 import math
 len_part = math.ceil(len(layers) / args.num_parts)
 
-with torch.no_grad():
-    for l in range(args.part_id * len_part, min((args.part_id + 1) * len_part, len(layers))):
-        layer_weights = layers[l].weight.clone()
-        nchannels = layers[l].layer.in_channels if isinstance(layers[l].layer, nn.Conv2d) else layers[l].layer.in_features
-        ngroups = math.ceil(nchannels / args.nchannelbatch)
-        layers[l].coded, layers[l].delta = [0] * ngroups, [0] * ngroups
+for l in range(args.part_id * len_part, min((args.part_id + 1) * len_part, len(layers))):
+    nchannels = layers[l].out_channels if isinstance(layers[l], nn.Conv2d) else layers[l].out_features
+    ngroups = math.ceil(nchannels / args.nchannelbatch)
 
-        acti_delta = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
-        acti_coded = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
-        acti_Y_sse = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
-        acti_Y_top = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
+    acti_delta = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
+    acti_coded = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
+    acti_Y_sse = torch.ones(maxrates,maxsteps,1,device=getdevice()) * Inf
 
+    hook = hooklayers([layers[l]])[0]
+    backward_hook = hooklayers([layers[l]], backward=True)[0]
+
+    grad_list = []
+    fp_acts_list = []
+    net.train()
+    for c, data in enumerate(loader):
+        try:
+            x = data[0]["data"]
+        except:
+            x, _ = data
+            x = x.cuda()
+        res = torch.norm(net(x), p=2)
+        # res = net(x).sum()
+        res.backward()
+
+        grad_list.append(backward_hook.output_tensor[0][None, ...])
+        fp_acts_list.append(hook.output_tensor)
+
+        for p in net.parameters():
+            p.grad = None
+        
+
+    net.eval()
+    dimens = {l: hook.output if isinstance(layers[l], nn.Conv2d) else hook.output.flip(0)}
+    
+    hook.close()
+    backward_hook.close()
+
+    with torch.no_grad():
         for g in range(0, ngroups):
-            layers[l].group_id = g
-
             chans_per_group = min(nchannels - g * args.nchannelbatch, args.nchannelbatch)
             coded = chans_per_group * (dimens[l][1:].prod() if len(dimens[l]) > 1 else 1)
+
+            grad = transform(torch.cat(grad_list, dim=0))[..., g * args.nchannelbatch: (g + 1) * args.nchannelbatch]
+            fpact_group = transform(torch.cat(fp_acts_list, dim=0))[..., g * args.nchannelbatch: (g + 1) * args.nchannelbatch]
+
+            # hessians_blockwise = [args.kappa * torch.eye(chans_per_group, device=getdevice()) + (1. / grad.shape[0]) * grad[:, t].T @ grad[:, t] for t in range(grad.shape[1])]
 
             scale = 0
             start = scale 
@@ -128,56 +170,42 @@ with torch.no_grad():
                 for j in range(0,maxsteps):
                     sec = time()
                     delta = start + 0.25*j
-                    layers[l].quantized, layers[l].coded[g], layers[l].delta[g], layers[l].chans_per_group = True, coded*b, delta, chans_per_group
 
-                    for l_ in layers:
-                        l_.count = 0
-                    
-                    if args.Amse:
-                        hookedlayer_fpact = Hook(layers[l], fp_act=fp_acts[l])
-                    if args.profile:
-                        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=True, use_cuda=True,
-                            on_trace_ready=lambda p: print(p.key_averages().table(sort_by="cpu_time_total", row_limit=15))) as prof:
-                            
-                            with record_function("forward"):
-                                Y_hats = predict_dali(neural,loader)
-                        exit()
-                    else:
-                        Y_hats = predict_dali(neural,loader)
-                    top_1, top_5 = accuracy(Y_hats, labels, topk=(1, 5))
+                    quantized_group = common.quantize(fpact_group.clone(), 2 ** delta, b)
+                    delta_act = quantized_group - fpact_group
+
+                    first_order_dist = 0 #(delta_act * grad).sum() / grad.shape[0]
+                    # second_order_dist = sum(0.5 * delta_act[s, t][None, :] @ hessians_blockwise[t] @ delta_act[s, t][:, None] for t in range(len(hessians_blockwise)) for s in range(len(loader))) / len(loader)
+                    second_order_dist = 0.5 * args.kappa * delta_act.pow(2).sum() / len(grad) 
+                    # second_order_dist += 0.5 * sum(torch.diag(grad[:, t] @ delta_act[:, t].T).pow(2).sum() / grad.shape[0] for t in range(grad.shape[1])) / len(loader)
+                    second_order_dist += 0.5 * torch.diag(grad.flatten(1) @ delta_act.flatten(1).T ).pow(2).sum() / len(grad)
+
+                    cur_dist = first_order_dist + second_order_dist
+
                     sec = time() - sec
-                    # import pdb; pdb.set_trace()
-                    acti_Y_sse[b,j,0] = ((Y_hats - Y)**2).mean() if not args.Amse else hookedlayer_fpact.accum_err_act
-                    acti_Y_top[b,j,0] = top_1
-                    acti_delta[b,j,0] = layers[l].delta[g]
-                    acti_coded[b,j,0] = layers[l].coded[g]
+                    acti_Y_sse[b,j,0] = cur_dist
+                    acti_delta[b,j,0] = delta
+                    acti_coded[b,j,0] = coded*b
                     # acti_mean[b,j] = hookedlayers[l].mean_err_a
 
                     mean_Y_sse = acti_Y_sse[b,j,0]
-                    mean_Y_top = acti_Y_top[b,j,0]
                     #mean_W_sse = acti_W_sse[b,j,0]
                     
-                    #print('%d, %d, %f' % (b, j, acti_Y_sse[b,j,0]))
                     if b >= 2 and mean_Y_sse > last_Y_sse or b == 0:
                         break
 
                     last_Y_sse = mean_Y_sse
-                    if args.Amse:
-                        hookedlayer_fpact.close()
 
                 _, j = acti_Y_sse[b,:,0].min(0)
                 delta = acti_delta[b,j,0]
                 start = delta - 2
                 mean_Y_sse = acti_Y_sse[b,j,0]
-                mean_Y_top = acti_Y_top[b,j,0]
                 if not args.mute_print:
                     print('%s | layer: %03d/%03d, channel: %d, delta: %+6.2f, '
-                        'mse: %5.2e (%5.2e), top1: %5.2f, numel: %5.2e, rate: %4.1f, time: %5.2fs'\
-                        % (args.archname, l, len(layers), g * args.nchannelbatch, delta, mean_Y_sse, mean_Y_sse, mean_Y_top,\
+                        'mse: %5.2e, numel: %5.2e, rate: %4.1f, time: %5.2fs'\
+                        % (args.archname, l, len(layers), g * args.nchannelbatch, delta, mean_Y_sse, \
                             coded, b, sec))
-            layers[l].quantized, layers[l].coded[g], layers[l].delta[g] = False, 0, 0
 
             io.savemat(('%s/%s_val_%03d_%04d_output_acti.mat' % (path_output, args.archname,l,g)),
                     {'acti_coded':acti_coded.cpu().numpy(),'acti_Y_sse':acti_Y_sse.cpu().numpy(),
-                        'acti_Y_top':acti_Y_top.cpu().numpy(),'acti_delta':acti_delta.cpu().numpy()})
-        layers[l].group_id = -1
+                        'acti_delta':acti_delta.cpu().numpy()})

@@ -58,6 +58,7 @@ parser.add_argument('--bit_rate', default=0, type=int,
 parser.add_argument('--relu_bitwidth', default=-1, type=int,
                     help='bit width of activations')
 parser.add_argument('--quant-type', default='linear', type=str, choices=['linear', 'log2'])
+parser.add_argument('--override-checkpoint', default='', type=str)
 parser.add_argument('--bias_corr_weight', '-bcw', action="store_true")
 parser.add_argument('--bias_corr_act', '-bca', action="store_true")
 parser.add_argument('--bca_version', default=1, type=int)
@@ -70,17 +71,18 @@ parser.add_argument('--re-train', action="store_true")
 parser.add_argument('--re-train-lr', default=0.0001, type=float)
 parser.add_argument('--re-train-iter', default=20, type=int)
 parser.add_argument('--re-train-epoch', default=1, type=int)
-
+parser.add_argument('--smooth-dists', action="store_true")
 parser.add_argument('--adaptive_act_delta', action="store_true")
 
-parser.add_argument("--redo-dp", action="store_true")
 parser.add_argument("--debug_layer_i", default=-1, type=int)
+parser.add_argument("--act_dist_penalty_scale", default=1.0, type=float)
+parser.add_argument("--act_curve_root_dir", default="./", type=str)
 args = parser.parse_args()
 args.val_testsize = args.testsize
+
 if (args.re_train or args.re_calibrate) and args.re_train_epoch > 1:
     print(f"WARN: ignoring retrain iteration config, using retrain epoch={args.re_train_epoch}")
     args.re_train_iter = -1
-
 
 tranname = "idt"
 trantype = "exter"
@@ -97,6 +99,11 @@ else:
 codeacti = True
 
 srcnet = loadnetwork(args.archname, args.gpuid)
+
+if args.override_checkpoint != '':
+    all_ = srcnet.load_state_dict(torch.load(args.override_checkpoint), strict=False)
+    print(all_)
+    print('load checkpoint from %s' % args.override_checkpoint)
 
 tarnet = copy.deepcopy(srcnet)
 tarnet = convert_qconv_new(tarnet, stats=False).cuda()
@@ -128,17 +135,16 @@ Y_norm = Y / ((Y**2).sum().sqrt())
 
 nlayers = len(tarlayers)
 
-
-
 # loader = get_val_imagenet_dali_loader(args)
 
 nweights = cal_total_num_weights(tarlayers)
 print('total num layers %d weights on %s is %d' % (nlayers, args.archname, nweights))
-dimens = [tardimens[i].input if isinstance(tarlayers[i].layer, nn.Conv2d) else tardimens[i].input.flip(0) for i in range(0,len(tardimens))]
+dimens = [tardimens[i].output if isinstance(tarlayers[i].layer, nn.Conv2d) else tardimens[i].output.flip(0) for i in range(0,len(tardimens))]
 # print("\n".join((str(d) for d in dimens)))
 
 rd_rate, rd_rate_entropy, rd_dist, rd_phi, rd_delta, rd_delta_mse, rd_dist_mse = \
     load_rd_curve_batch(args.archname, srclayers, args.maxdeadzones, args.maxrates, args.pathrdcurve, args.nchannelbatch, closedeadzone=args.closedeadzone)
+
 
 
 rd_act_dist = []
@@ -149,7 +155,7 @@ act_sizes = []
 for l in range(0,len(srclayers)):
     ##load files here
     # layer_weights_idx = srclayers[l].weight.clone()
-    nchannels = tarlayers[l].layer.in_channels if isinstance(tarlayers[l].layer, nn.Conv2d) else tarlayers[l].layer.in_features
+    nchannels = tarlayers[l].layer.out_channels if isinstance(tarlayers[l].layer, nn.Conv2d) else tarlayers[l].layer.out_features
     ngroups = math.ceil(nchannels / args.nchannelbatch)
     
     coded_g, delta_g = [0] * ngroups, [0] * ngroups
@@ -162,9 +168,9 @@ for l in range(0,len(srclayers)):
         tarlayers[l].chans_per_group = min(nchannels - g * args.nchannelbatch, args.nchannelbatch)
         
         curve_test_size = int(args.pathrdcurve.split("ns_")[-1][:4])
-        acti_Y_sse, acti_delta, acti_coded = loadrdcurves(args.archname, l, g, 'acti', args.nchannelbatch, args.Amse, curve_test_size)
-        
+        acti_Y_sse, acti_delta, acti_coded = loadrdcurves(args.archname, l, g, 'acti', args.nchannelbatch, args.Amse, curve_test_size, mode="out_channel", prefix=args.act_curve_root_dir)
         rst_act_bit_groups.append(np.arange(0, len(acti_Y_sse)))
+
         rst_act_dist_groups.append(np.min(acti_Y_sse[..., 0], axis=1))
         rst_act_delta_groups.append(np.array([acti_delta[b, np.argmin(acti_Y_sse[b]), 0] for b in range(len(acti_delta))]))
         act_sizes_group.append(acti_coded[1, 0, 0].astype(int))
@@ -174,6 +180,8 @@ for l in range(0,len(srclayers)):
     rd_act_delta.append(rst_act_delta_groups)
     act_sizes.append(act_sizes_group)
     rd_act_coded.append(rst_act_coded_groups)
+
+
 
 
 hist_sum_W_sse = torch.ones(maxsteps,device=getdevice()) * Inf
@@ -205,19 +213,19 @@ solve_times = []
 for j in range(len(args.target_rates)):
     target_rate = args.target_rates[j]
 
-    G_dir = args.pathrdcurve.rstrip("/") + ("_Amse" if args.Amse else "") + "_DP_G_" + ("8.0" if args.gen_rate_curves else f"{target_rate:.1f}")
-    if args.redo_dp:
-        print(f"Removing {G_dir}")  
-        os.system(f"rm -rf {G_dir}")
-
-    pc_phi, pc_delta, pc_bits, pc_size, pc_act_dist, pc_act_bits, pc_act_delta, pc_act_coded = dp_quantize(srclayers, rd_rate, rd_dist, rd_phi, rd_delta, 
+    print(args.act_dist_penalty_scale)
+    pc_phi, pc_delta, pc_bits, pc_size, pc_act_dist, pc_act_bits, pc_act_delta, pc_act_coded = lg_quantize(srclayers, rd_rate, rd_dist, rd_phi, rd_delta, 
                                                                                                                     rd_act_dist, rd_act_bits, rd_act_delta, act_sizes, 
                                                                                                                     args.nchannelbatch, 
-                                                                                                                    target_rate, device="cuda", piece_length=2**20, 
-                                                                                                                    G_dir=G_dir)
+                                                                                                                    target_rate, act_dist_penalty_scale=args.act_dist_penalty_scale,
+                                                                                                                    smooth_dists=args.smooth_dists,
+                                                                                                                    minrate=args.minrate)
     hist_sum_W_sse[j] = hist_sum_Y_sse[j] = pred_sum_Y_sse[j] = hist_sum_coded_huffman[j] = hist_sum_coded_tunstall[j] = 0.0
     hist_sum_coded[j] = hist_sum_coded_w[j] = hist_sum_coded_a[j] = hist_sum_Y_tp1[j] = hist_sum_Y_tp5[j] = hist_sum_denom[j] = hist_sum_denom_w[j] = hist_sum_denom_a[j] = 0.0
-
+    
+    print("Allocated bits:")
+    print(f"{pc_bits=}")
+    print(f"{pc_act_bits=}")
 
     with torch.no_grad():
         if args.output_bit_allocation:
@@ -235,14 +243,16 @@ for j in range(len(args.target_rates)):
             ##load files here
             layer_weights = srclayers[l].weight.clone()
             # layer_weights_idx = srclayers[l].weight.clone()
-            nchannels = tarlayers[l].layer.in_channels if isinstance(tarlayers[l].layer, nn.Conv2d) else tarlayers[l].layer.in_features
+            nchannels = tarlayers[l].layer.out_channels if isinstance(tarlayers[l].layer, nn.Conv2d) else tarlayers[l].layer.out_features
             ngroups = math.ceil(nchannels / args.nchannelbatch)
+            tarlayers[l].mode = "out_channel"
             
             if codeacti:
                 tarlayers[l].quantized = 0 < l < len(srclayers) - 1
                 coded_g, delta_g = [0] * ngroups, [0] * ngroups
                 for g in range(ngroups):
                     tarlayers[l].chans_per_group = min(nchannels - g * args.nchannelbatch, args.nchannelbatch)
+                    tarlayers[l].adaptive_delta = args.adaptive_act_delta
                     
                     begin = time.time()
                     solve_times[-1] += time.time() - begin
@@ -320,25 +330,36 @@ for j in range(len(args.target_rates)):
         hist_sum_coded[j] += total_rates_bits
 
 
+
+    with torch.no_grad():        
+        Y_hats = predict_fn(tarnet, loader)
+        hist_sum_Y_tp1[j], hist_sum_Y_tp5[j] = accuracy(Y_hats, labels, topk=(1, 5))
+        hist_sum_W_sse[j] = hist_sum_W_sse[j]/hist_sum_denom[j]
+        hist_sum_Y_sse[j] = ((Y_hats - Y)**2).mean()
+        hist_sum_coded[j] = hist_sum_coded[j]/hist_sum_denom[j]
+        hist_sum_coded_huffman[j] = rates_huffman / hist_sum_denom[j]
+        hist_sum_coded_tunstall[j] = rates_tunstall / hist_sum_denom[j]
+        sec = time.time() - sec
+
+
     
     if args.re_calibrate:
         print("Re-calibrating...")
+        args.val_testsize = 1024
         if "384" in args.archname:
-            train_loader, _ = get_trainval_imagenet_dali_loader(args, 384, 384)
+            calib_loader = get_calib_imagenet_dali_loader(args, 384, 384)
         else:
-            train_loader, _ = get_trainval_imagenet_dali_loader(args)
-
-        tarnet = retrain_bias(tarnet, train_loader, lr=args.re_calibrate_lr, iters=1000)
+            calib_loader = get_calib_imagenet_dali_loader(args)
+        
+        args.val_testsize = -1
+        tarnet = retrain_bias(tarnet, calib_loader, lr=args.re_calibrate_lr, iters=args.re_train_iter, epochs=args.re_train_epoch)
 
         with torch.no_grad():        
             Y_hats = predict_fn(tarnet, loader)
             print("Re-calibrated accuracy: ", accuracy(Y_hats, labels, topk=(1, 5)))
-    
+
     if args.re_train:
         print("Re-training...")
-        args.val_testsize = -1
-        args.testsize = -1
-
         if "384" in args.archname:
             train_loader, _ = get_trainval_imagenet_dali_loader(args, 384, 384)
         else:
@@ -353,12 +374,12 @@ for j in range(len(args.target_rates)):
             layer.delta = torch.from_numpy(delta).to(getdevice())
             layer.bits = torch.from_numpy(bits).to(getdevice())
             layer.deltas_act = torch.from_numpy(pc_act_delta[l]).to(getdevice())
-            layer.coded = pc_act_coded[l]
+            layer.coded = torch.from_numpy(pc_act_coded[l]).to(getdevice())
             layer.chans_per_group = args.nchannelbatch
             layer.quantized =  0 < l < len(net2_layers) - 1
-            layer.mode = "in_channel"
+            layer.mode = "out_channel"
            
-            layer.adaptive_delta = True
+            layer.adaptive_delta = False
 
         net2 = retrain(net2, train_loader, lr=args.re_train_lr, iters=args.re_train_iter, epochs=args.re_train_epoch)
         
@@ -366,7 +387,7 @@ for j in range(len(args.target_rates)):
             layer.adaptive_delta = args.adaptive_act_delta
             layer.bcw = bcorr_weight if args.bias_corr_weight else None
             assert args.bca_version == 1
-            layer.bca = bcorr_act_factory(args.bca_version) # Not support version 2
+            layer.bca = bcorr_act_factory(args.bca_version) if args.bias_corr_act else None # Not support version 2
 
         with torch.no_grad():        
             Y_hats = predict_fn(net2, loader)
@@ -374,21 +395,13 @@ for j in range(len(args.target_rates)):
         
         del net2, net2_layers
 
-    with torch.no_grad():        
-        Y_hats = predict_fn(tarnet, loader)
-        hist_sum_Y_tp1[j], hist_sum_Y_tp5[j] = accuracy(Y_hats, labels, topk=(1, 5))
-        hist_sum_W_sse[j] = hist_sum_W_sse[j]/hist_sum_denom[j]
-        hist_sum_Y_sse[j] = ((Y_hats - Y)**2).mean()
-        hist_sum_coded[j] = hist_sum_coded[j]/hist_sum_denom[j]
-        hist_sum_coded_huffman[j] = rates_huffman / hist_sum_denom[j]
-        hist_sum_coded_tunstall[j] = rates_tunstall / hist_sum_denom[j]
-        sec = time.time() - sec
-
     print('%s %s | target rate: %+5.1f, ymse: %5.2e (%5.2e), wmse: %5.2e, topk: %5.2f (%5.2f), rate: %5.2f, tuns rate: %5.2f, huff rate: %5.2f' %\
             (args.archname, tranname, target_rate, hist_sum_Y_sse[j], pred_sum_Y_sse[j], \
             hist_sum_W_sse[j], hist_sum_Y_tp1[j], hist_sum_Y_tp5[j],  hist_sum_coded[j], hist_sum_coded_tunstall[j], hist_sum_coded_huffman[j]))
     print(f'Avg Optimization Time: {sum(solve_times) / len(solve_times):.3f} s')
     
+    torch.save(tarnet.state_dict(), f'{args.archname}_act_out_nchan_{args.nchannelbatch}_target_{target_rate:.1f}.pth')
+
     with open(f'{args.archname}_acc_dist_curve_dp.txt', "a+") as f:
         f.write(f"{hist_sum_coded[j]}, {hist_sum_Y_tp1[j]}, {hist_sum_Y_sse[j]}\n")
     

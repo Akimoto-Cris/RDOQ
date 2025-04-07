@@ -4,11 +4,16 @@ import numpy as np
 import scipy.io as io
 import tunstall
 
+import common
 from tunstall import *
 from common import *
 from scipy.stats import entropy
 from itertools import product
+import rle
+from time import time
 
+
+INT_MIN = -2147483648
 eps = 1e-12
 
 def get_num_input_channels(tensor_weights):
@@ -49,14 +54,24 @@ def get_output_channels_inds(tensor_weights, inds):
     weights_copy = tensor_weights.clone()
     return weights_copy[inds]
 
+def get_input_channels_inds(tensor_weights, inds):
+    weights_copy = tensor_weights.clone()
+    return weights_copy[:, inds]
+
 def assign_output_channels(tensor_weights, st_id, ed_id, quant_weights):
     if len(tensor_weights.shape) == 2:
         tensor_weights = tensor_weights[..., None, None]
     tensor_weights[st_id:ed_id, :, :, :] = quant_weights
 
+def assign_input_channels(tensor_weights, st_id, ed_id, quant_weights):
+    tensor_weights[:, st_id:ed_id, :, :] = quant_weights
 
 def assign_output_channels_inds(tensor_weights, inds, quant_weights):
     tensor_weights[inds, ...] = quant_weights
+
+def assign_input_channels_inds(tensor_weights, inds, quant_weights):
+    tensor_weights[:, inds, ...] = quant_weights
+
 
 #####################
 
@@ -152,6 +167,23 @@ def uniform_quantize_centroid(data, stepsize, ncentroid):
     max_point = +((ncentroid - 1)/2) * stepsize
     return (((data / stepsize).round()) * stepsize).clamp(min_point , max_point)
 
+
+def log_quantize(data, phi, stepsize, b):
+    if b <= eps:
+        return data * 0
+
+    if phi > 0:
+        mask_deadzone = ((data < (-1.0 * phi)) | (data > phi)).float()
+    sign_data = torch.sign(data)
+    q_data = (torch.log2(torch.abs(data) + eps) / stepsize).round().clamp(-2**(b-1), 0)
+
+    A = q_data.exp2().mul(stepsize)
+    B = A * sign_data
+
+    C = B * (mask_deadzone.float()) if phi > 0 else B
+    
+    return B
+
 def calc_entropy(data):
     data_copy = data.clone()
     #value, counts = np.unique(data_copy.cpu().numpy(), return_counts=True)
@@ -201,7 +233,6 @@ def load_rd_curve_batch(archname, layers, maxdeadzones, maxrates, datapath, ncha
     rd_dist_mse = [0] * nlayers
 
     for l in range(0, nlayers):
-        # nchannels = get_num_input_channels(layers[l].weight)
         nchannels = get_num_output_channels(layers[l].weight)
         nbatch = nchannels // nchannelbatch
         if (nchannels % nchannelbatch) != 0:
@@ -570,7 +601,6 @@ def cal_total_rates(layers, pc_rate, nchannelbatch):
     for l in range(0, nlayers):
         #[nfilters, ndepth, nheight, nwidth] = layers[l].weight.size()
         #nfilters = layers[l].weight.size()[0]
-        #nchannels = get_num_input_channels(layers[l].weight)
         nchannels = get_num_output_channels(layers[l].weight)
         cnt = 0
         for f in range(0, nchannels, nchannelbatch):
@@ -727,11 +757,78 @@ def bcorr_act_factory(version=2, *args, **kwargs):
         return partial(bcorr_act_v2, *args, **kwargs)
 
 
+def greedy_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta, 
+                rd_act_dist, rd_act_bits, rd_act_delta, act_sizes, 
+                nchannelbatch, target_rate):
+
+    chngrp_indices = []
+    nlayers = len(layers)
+    i = 0
+    for l in range(nlayers):
+        chngrp_indices.append([])
+        for g in range(len(rd_dist[l])):
+            chngrp_indices[l].append(i)
+            i += 1
+
+    nweights = []
+    nweights_layer = []
+    for l in range(nlayers):
+        nweights_layer.append([])
+        for g in range(len(chngrp_indices[l])):
+            nweights_layer[l].append(layers[l].weight[g * nchannelbatch: (g + 1) * nchannelbatch].numel())
+        nweights += nweights_layer[l]
+    
+    for l in range(nlayers):
+        nweights += act_sizes[l]
+
+    total_weights = sum(nweights)
+
+    for l in range(nlayers):
+        chngrp_indices.append([])
+        for g in range(len(rd_act_dist[l])):
+            chngrp_indices[l + nlayers].append(i)
+            i += 1
+
+    rd_dist_uvld = [np.min(rd_dist[l][g], axis=0) for l in range(len(rd_dist)) for g in range(len(rd_dist[l]))]
+    phi_select = [[np.argmin(rd_dist[l][g], axis=0).astype(int) for g in range(len(rd_dist[l]))] for l in range(len(rd_dist))]
+    rd_rate_uvld = [rd_rate[l][g][0] / nweights_layer[l][g] for l in range(len(rd_rate)) for g in range(len(rd_rate[l]))]
+    rd_dist_uvld += [rd_act_dist[l][g] for l in range(len(rd_act_dist)) for g in range(len(rd_act_dist[l]))]
+    rd_rate_uvld += [rd_act_bits[l][g] for l in range(len(rd_act_bits)) for g in range(len(rd_act_bits[l]))]
+    nchngrps = len(rd_dist_uvld)
+    R = int(target_rate * total_weights)
+
+    grd_bits = [0 for _ in range(nchngrps)]
+
+    while R > 0:
+        slopes = []
+        for n in range(nchngrps):
+            if grd_bits[n] < len(rd_dist_uvld[n]) - 1:
+                slopes.append(rd_dist_uvld[n][grd_bits[n]] - rd_dist_uvld[n][grd_bits[n]+1])
+            else:
+                slopes.append(INT_MIN)
+        max_slope_idx = slopes.index(max(slopes))
+        grd_bits[max_slope_idx] += 1
+        R -= nweights[max_slope_idx]
+    
+    grd_layer_bits = [np.array([grd_bits[chngrp_indices[l][g]] for g in range(len(chngrp_indices[l]))]).astype(int) for l in range(nlayers)]
+    grd_phi = [np.array([rd_phi[l][g, phi_select[l][g][grd_layer_bits[l][g]], grd_layer_bits[l][g]] for g in range(len(grd_layer_bits[l]))]) for l in range(nlayers)]
+    grd_delta = [np.array([rd_delta[l][g, phi_select[l][g][grd_layer_bits[l][g]], grd_layer_bits[l][g]] for g in range(len(grd_layer_bits[l]))]) for l in range(nlayers)]
+    grd_size_layer = [grd_layer_bits[l] * np.array(nweights_layer[l]) for l in range(nlayers)]
+
+    grd_act_bits_layer = [np.array([grd_bits[chngrp_indices[l][g]] for g in range(len(chngrp_indices[l]))]).astype(int) for l in range(nlayers, nlayers*2)]
+    grd_act_delta = [np.array([rd_act_delta[l][g][grd_act_bits_layer[l][g]] for g in range(len(grd_act_bits_layer[l]))]) for l in range(nlayers)]
+    grd_act_coded = [np.array([act_sizes[l][g] * grd_act_bits_layer[l][g] for g in range(len(grd_act_bits_layer[l]))]) for l in range(nlayers)]
+    grd_act_dist = [np.array([rd_act_dist[l][g][grd_act_bits_layer[l][g]] for g in range(len(grd_act_bits_layer[l]))]) for l in range(nlayers)]
+
+    return grd_phi, grd_delta, grd_layer_bits, grd_size_layer, grd_act_dist, grd_act_bits_layer, grd_act_delta, grd_act_coded
+
+
+
 import tqdm, pickle, os, rle
 
 def dp_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta, 
                 rd_act_dist, rd_act_bits, rd_act_delta, act_sizes, 
-                nchannelbatch, target_rate, device="cuda", piece_length=4096, G_dir=""):
+                nchannelbatch, target_rate, device="cuda", piece_length=4096, G_dir="", act_dist_penalty_scale=1.0, smooth_dists=False, manual_offset=0):
 
     device = torch.device(device)
 
@@ -769,15 +866,20 @@ def dp_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta,
     rd_dist_uvld = [np.min(rd_dist[l][g], axis=0) for l in range(len(rd_dist)) for g in range(len(rd_dist[l]))]
     phi_select = [[np.argmin(rd_dist[l][g], axis=0).astype(int) for g in range(len(rd_dist[l]))] for l in range(len(rd_dist))]
     rd_rate_uvld = [rd_rate[l][g][0] / nweights_layer[l][g] for l in range(len(rd_rate)) for g in range(len(rd_rate[l]))]
-    rd_dist_uvld += [rd_act_dist[l][g] for l in range(len(rd_act_dist)) for g in range(len(rd_act_dist[l]))]
+    rd_dist_uvld += [rd_act_dist[l][g] * act_dist_penalty_scale for l in range(len(rd_act_dist)) for g in range(len(rd_act_dist[l]))]
     rd_rate_uvld += [rd_act_bits[l][g] for l in range(len(rd_act_bits)) for g in range(len(rd_act_bits[l]))]
-    sorted_rd_dist = [torch.tensor(rd_dist_uvld[sort_idx]).half().to(device) for sort_idx in sorted_chngrp_indices]
+    sorted_rd_dist = [torch.tensor(rd_dist_uvld[sort_idx]).half().to(device)  for sort_idx in sorted_chngrp_indices]
     sorted_rd_rate = [torch.tensor(rd_rate_uvld[sort_idx]).to(device) for sort_idx in sorted_chngrp_indices]
+
+    if smooth_dists:
+        for i in range(len(sorted_rd_dist)):
+            sorted_rd_dist[i], _ = make_nonincreasing(sorted_rd_dist[i], sorted_rd_rate[i])
+
     nchngrps = len(rd_dist_uvld)
     R = int(target_rate * total_weights)
     
     tmp_g_dir = G_dir or f"./G_tmps_rate{target_rate}/" 
-    if not G_dir and not os.path.exists(tmp_g_dir):
+    if not os.path.exists(tmp_g_dir):
         os.makedirs(tmp_g_dir)
     if len(os.listdir(tmp_g_dir)) < nchngrps:
         # G = pickle.load(open(tmp_g_path, "rb"))
@@ -832,16 +934,22 @@ def dp_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta,
             
             dp[0, :] = dp[1, :]
             del allowed_bit_masks, sizes_
-        
+
+            values, counts = run_length_encoding(G)
+
             with open(tmp_g_dir + f"/G_{n}.pkl", "wb") as f:
-                pickle.dump(G.to("cpu"), f)
+                pickle.dump({"values": values, "counts": counts}, f)
 
     dp_bits = [0 for _ in range(nchngrps)]
     remained_size = R
     for sort_idx, n in zip(sorted_chngrp_indices[::-1], range(nchngrps-1, -1, -1)):
-        G_n = pickle.load(open(tmp_g_dir + f"/G_{n}.pkl", "rb")).to(device)
+        G_n_encoded = pickle.load(open(tmp_g_dir + f"/G_{n}.pkl", "rb"))
+        G_n = run_length_decoding(G_n_encoded["values"], G_n_encoded["counts"]).to(device)
         dp_bits[sort_idx] = sorted_rd_rate[n][G_n[min(len(G_n) - 1, max(0, remained_size - 1))].long()].item()
         remained_size = max(0, remained_size - int(dp_bits[sort_idx] * sorted_nweights[n]))
+
+    for j in range(len(dp_bits)):
+        dp_bits[j] = min(manual_offset + dp_bits[j], sorted_rd_rate[n].max().item())
 
     dp_bits_layer = [np.array([dp_bits[chngrp_indices[l][g]] for g in range(len(chngrp_indices[l]))]).astype(int) for l in range(nlayers)]
     dp_phi = [np.array([rd_phi[l][g, phi_select[l][g][dp_bits_layer[l][g]], dp_bits_layer[l][g]] for g in range(len(dp_bits_layer[l]))]) for l in range(nlayers)]
@@ -854,4 +962,194 @@ def dp_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta,
     dp_act_coded = [np.array([act_sizes[l][g] * dp_act_bits_layer[l][g] for g in range(len(dp_act_bits_layer[l]))]) for l in range(nlayers)]
     dp_act_dist = [np.array([rd_act_dist[l][g][dp_act_bits_layer[l][g]] for g in range(len(dp_act_bits_layer[l]))]) for l in range(nlayers)]
 
-    return dp_phi, dp_delta, dp_bits_layer, dp_size_layer, dp_act_dist, dp_act_bits_layer, dp_act_delta, dp_act_coded,
+    
+    # for f in os.listdir(tmp_g_dir):
+    #     os.remove(os.path.join(tmp_g_dir, f))
+    # os.removedirs(tmp_g_dir)
+
+    return dp_phi, dp_delta, dp_bits_layer, dp_size_layer, dp_act_dist, dp_act_bits_layer, dp_act_delta, dp_act_coded
+
+
+def lg_quantize(layers, rd_rate, rd_dist, rd_phi, rd_delta, 
+                rd_act_dist, rd_act_bits, rd_act_delta, act_sizes, 
+                nchannelbatch, target_rate, act_dist_penalty_scale=1.0, smooth_dists=False, minrate=0):
+
+    chngrp_indices = []
+    nlayers = len(layers)
+    i = 0
+    for l in range(nlayers):
+        chngrp_indices.append([])
+        for g in range(len(rd_dist[l])):
+            chngrp_indices[l].append(i)
+            i += 1
+
+    num_weight_groups = i
+    nweights = []
+    nweights_layer = []
+    for l in range(nlayers):
+        nweights_layer.append([])
+        for g in range(len(chngrp_indices[l])):
+            nweights_layer[l].append(layers[l].weight[g * nchannelbatch: (g + 1) * nchannelbatch].numel())
+        nweights += nweights_layer[l]
+    
+    for l in range(nlayers):
+        nweights += act_sizes[l]
+
+    total_weights = sum(nweights)
+    sorted_chngrp_indices = np.argsort(nweights)
+    sorted_nweights = sorted(nweights)
+
+    for l in range(nlayers):
+        chngrp_indices.append([])
+        for g in range(len(rd_act_dist[l])):
+            chngrp_indices[l + nlayers].append(i)
+            i += 1
+
+    rd_dist_uvld = [np.min(rd_dist[l][g], axis=0) for l in range(len(rd_dist)) for g in range(len(rd_dist[l]))]
+    phi_select = [[np.argmin(rd_dist[l][g], axis=0).astype(int) for g in range(len(rd_dist[l]))] for l in range(len(rd_dist))]
+    rd_rate_uvld = [rd_rate[l][g][0] / nweights_layer[l][g] for l in range(len(rd_rate)) for g in range(len(rd_rate[l]))]
+    rd_dist_uvld += [rd_act_dist[l][g] * act_dist_penalty_scale for l in range(len(rd_act_dist)) for g in range(len(rd_act_dist[l]))]
+    rd_rate_uvld += [rd_act_bits[l][g] for l in range(len(rd_act_bits)) for g in range(len(rd_act_bits[l]))]
+    sorted_rd_dist = [rd_dist_uvld[sort_idx] for sort_idx in sorted_chngrp_indices]
+    sorted_rd_rate = [rd_rate_uvld[sort_idx] for sort_idx in sorted_chngrp_indices]
+    sorted_nweights = sorted(nweights)
+
+    if smooth_dists:
+        for i in range(len(sorted_rd_dist)):
+            sorted_rd_dist[i], _ = make_nonincreasing(sorted_rd_dist[i], sorted_rd_rate[i])
+            sorted_rd_dist[i] = smooth(sorted_rd_dist[i], 0.2)
+
+    nchngrps = len(rd_dist_uvld)
+    R = int(target_rate * total_weights)
+
+    lg_bits = [0 for _ in range(nchngrps)]
+    
+    def target_func(slope):
+        size = 0
+        for i in range(nchngrps):
+            ys_0 = sorted_rd_dist[i] + (2 ** slope) * sorted_rd_rate[i]
+            point = max(np.argmin(ys_0), minrate)
+            size += sorted_rd_rate[i][point] * sorted_nweights[i]
+        ret = - size.astype(float) / total_weights
+        # print(f"Slope: {slope}, Size: {ret}")
+        return ret
+
+    begin = time()
+    slope = common.binary_search(-1000, 0, target_func, -target_rate, max_iters=200)
+
+    print(f"Slope search Time taken: {time() - begin}")
+    print(f"Slope: {slope}")
+
+    for i in range(nchngrps):
+        ys_0 = sorted_rd_dist[i] + (2 ** slope) * sorted_rd_rate[i]
+        point = max(np.argmin(ys_0), minrate)
+        lg_bits[i] = sorted_rd_rate[i][point]
+
+
+    lg_bits_layer = [np.array([lg_bits[chngrp_indices[l][g]] for g in range(len(chngrp_indices[l]))]).astype(int) for l in range(nlayers)]
+    lg_phi = [np.array([rd_phi[l][g, phi_select[l][g][lg_bits_layer[l][g]], lg_bits_layer[l][g]] for g in range(len(lg_bits_layer[l]))]) for l in range(nlayers)]
+    lg_delta = [np.array([rd_delta[l][g, phi_select[l][g][lg_bits_layer[l][g]], lg_bits_layer[l][g]] for g in range(len(lg_bits_layer[l]))]) for l in range(nlayers)]
+    # lg_phi = [np.array([rd_phi[l][g, phi_select[l][g][lg_bits_layer[l][g]], lg_bits_layer[l][g]] for g in range(len(lg_bits_layer[l]))]) for l in range(nlayers)]
+    lg_size_layer = [lg_bits_layer[l] * np.array(nweights_layer[l]) for l in range(nlayers)]
+
+    lg_act_bits_layer = [np.array([lg_bits[chngrp_indices[l][g]] for g in range(len(chngrp_indices[l]))]).astype(int) for l in range(nlayers, nlayers*2)]
+    lg_act_delta = [np.array([rd_act_delta[l][g][lg_act_bits_layer[l][g]] for g in range(len(lg_act_bits_layer[l]))]) for l in range(nlayers)]
+    lg_act_coded = [np.array([act_sizes[l][g] * lg_act_bits_layer[l][g] for g in range(len(lg_act_bits_layer[l]))]) for l in range(nlayers)]
+    lg_act_dist = [np.array([rd_act_dist[l][g][lg_act_bits_layer[l][g]] for g in range(len(lg_act_bits_layer[l]))]) for l in range(nlayers)]
+
+    
+    # for f in os.listdir(tmp_g_dir):
+    #     os.remove(os.path.join(tmp_g_dir, f))
+    # os.removedirs(tmp_g_dir)
+
+    return lg_phi, lg_delta, lg_bits_layer, lg_size_layer, lg_act_dist, lg_act_bits_layer, lg_act_delta, lg_act_coded
+
+
+
+def run_length_encoding(x):
+    # Flatten the input tensor
+    x_flat = x.view(-1)
+    
+    # Identify the start of each run
+    change_indices = torch.cat((torch.tensor([0], device=x.device), (x_flat[1:] != x_flat[:-1]).nonzero(as_tuple=False).squeeze(1) + 1, torch.tensor([x_flat.size(0)], device=x.device)))
+    
+    # Calculate the lengths of each run
+    run_lengths = change_indices[1:] - change_indices[:-1]
+    
+    # Gather the values of each run
+    run_values = x_flat[change_indices[:-1]]
+    
+    return run_values, run_lengths
+
+def run_length_decoding(values, lengths):
+    # Calculate the total length of the decoded tensor
+    total_length = lengths.sum().item()
+    
+    # Initialize an empty tensor to store the decoded values
+    decoded = torch.empty(total_length, dtype=values.dtype, device=values.device)
+    
+    # Use cumulative sum to get the end indices of each run
+    end_indices = lengths.cumsum(dim=0)
+    
+    # Use the end indices to fill the decoded tensor
+    start_index = 0
+    for value, end_index in zip(values, end_indices):
+        decoded[start_index:end_index] = value
+        start_index = end_index
+    
+    return decoded
+
+@torch.no_grad()
+def get_bops_model(net, layers, output_dimens, bit_weights, return_base=False):
+    net.eval()
+
+    layer_sizes = [torch.tensor(layer.weight.shape) for layer in layers]
+    coded_acts = [layers[i].coded for i in range(0, len(layers))]
+
+    nom_bops = 0.0
+    denom_bops = 0.0
+
+    for o_dim, size, b_w, c_a, m in zip(output_dimens, layer_sizes, bit_weights, coded_acts, layers):
+        b_a_mean = sum(c_a) / o_dim.prod()
+        if isinstance(m.layer, torch.nn.Conv2d):
+            nom_bops += o_dim[0] * o_dim[-2:].prod() * size.prod() * np.array(b_w).mean() * b_a_mean + (0 if m.layer.bias is None else o_dim.prod() * 32 * 32)
+            denom_bops += o_dim[0] * o_dim[-2:].prod() * size.prod() * 32 * 32 + (0 if m.layer.bias is None else o_dim.prod() * 32 * 32)
+        elif isinstance(m.layer, torch.nn.Linear):
+            nom_bops += o_dim[:-1].prod() * size.prod() * np.array(b_w).mean() * b_a_mean + (0 if m.layer.bias is None else o_dim.prod() * 32 * 32)
+            denom_bops += o_dim[:-1].prod() * size.prod() * 32 * 32 + (0 if m.layer.bias is None else o_dim.prod() * 32 * 32)
+
+    if return_base:
+        return nom_bops, denom_bops
+    return nom_bops / denom_bops
+
+
+def make_nondecreasing(rd_dists, rd_amounts):
+    for i in range(1, len(rd_dists)):
+        rd_dists[i] = max(rd_dists[i-1], rd_dists[i])
+    return rd_dists, rd_amounts
+
+def make_nonincreasing(rd_dists, rd_amounts):
+    for i in range(1, len(rd_dists)):
+        rd_dists[i] = min(rd_dists[i-1], rd_dists[i])
+    return rd_dists, rd_amounts
+
+def smooth(rd_dists, weight=0.9):
+    """
+    EMA implementation according to
+    https://github.com/tensorflow/tensorboard/blob/34877f15153e1a2087316b9952c931807a122aa7/tensorboard/components/vz_line_chart2/line-chart.ts#L699
+    """
+    last = 0
+    smoothed = copy.deepcopy(rd_dists)
+    
+    num_acc = 0
+    for next_val in rd_dists:
+        last = last * weight + (1 - weight) * next_val
+        num_acc += 1
+        # de-bias
+        debias_weight = 1
+        if weight != 1:
+            debias_weight = 1 - weight ** num_acc
+        smoothed_val = last / debias_weight
+        smoothed[num_acc-1] = smoothed_val
+
+    return smoothed

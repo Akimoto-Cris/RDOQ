@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
-import algo
 import torch.nn.functional as F
 from itertools import repeat
 import collections.abc as container_abcs
 from torch.profiler import record_function
-import common
 import time
+import algo
+import common
 
 tochannelfirst = lambda x: x.permute(0, 3, 1, 2) # einops.rearrange(x, 'b h w c -> b c h w')
 tochannellast = lambda x: x.permute(0, 2, 3, 1) # einops.rearrange(x, 'b c h w -> b h w c')
